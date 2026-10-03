@@ -1,0 +1,145 @@
+"""
+Implements Binance's documented procedure for maintaining a correct local
+order book from the diff-depth WebSocket stream:
+https://developers.binance.com/docs/binance-spot-api-docs/web-socket-streams#how-to-manage-a-local-order-book-correctly
+
+State machine: SYNCING -> BUFFERING -> LIVE -> (on gap) -> SYNCING
+"""
+import asyncio
+import json
+import logging
+from enum import Enum, auto
+from typing import List, Optional
+
+import requests
+import websockets
+
+from metrics import Metrics
+from orderbook import OrderBook
+
+logger = logging.getLogger("sync_manager")
+
+BINANCE_REST_SNAPSHOT_URL = "https://api.binance.com/api/v3/depth"
+BINANCE_WS_URL_TEMPLATE = "wss://stream.binance.com:9443/ws/{symbol}@depth"
+
+
+class SyncState(Enum):
+    SYNCING = auto()     # connecting / buffering, no snapshot yet
+    BUFFERING = auto()   # snapshot loaded, waiting for first overlapping event
+    LIVE = auto()        # applying events in order, continuity-checked
+
+
+class SyncManager:
+    def __init__(self, symbol: str, depth_limit: int = 1000, metrics: Optional[Metrics] = None):
+        self.symbol = symbol.lower()
+        self.depth_limit = depth_limit
+        self.book = OrderBook(self.symbol)
+        self.metrics = metrics or Metrics()
+        self.state = SyncState.SYNCING
+        self._buffer: List[dict] = []
+        self._last_applied_u: Optional[int] = None
+
+    # --- snapshot handling -------------------------------------------------
+
+    def fetch_snapshot(self) -> dict:
+        params = {"symbol": self.symbol.upper(), "limit": self.depth_limit}
+        resp = requests.get(BINANCE_REST_SNAPSHOT_URL, params=params, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+
+    def _apply_snapshot(self, snapshot: dict) -> None:
+        self.book.load_snapshot(snapshot["lastUpdateId"], snapshot["bids"], snapshot["asks"])
+        self._last_applied_u = snapshot["lastUpdateId"]
+        self.metrics.record_snapshot()
+
+    def _try_bootstrap_from_buffer(self) -> bool:
+        """Discard stale buffered events, then apply the first event that
+        overlaps the snapshot and everything after it. Returns True once LIVE."""
+        last_id = self.book.last_update_id
+        self._buffer = [e for e in self._buffer if e["u"] > last_id]
+
+        start_index = None
+        for i, event in enumerate(self._buffer):
+            if event["U"] <= last_id + 1 <= event["u"]:
+                start_index = i
+                break
+
+        if start_index is None:
+            return False  # keep buffering
+
+        for event in self._buffer[start_index:]:
+            self._apply_event(event)
+        self._buffer.clear()
+        self.state = SyncState.LIVE
+        logger.info("Book for %s is now LIVE at lastUpdateId=%s", self.symbol, self.book.last_update_id)
+        return True
+
+    def _apply_event(self, event: dict) -> None:
+        self.book.apply_update(event["b"], event["a"], event["U"], event["u"])
+        self._last_applied_u = event["u"]
+        self.metrics.record_update(event)
+
+    def bootstrap(self) -> None:
+        """Synchronous: fetch snapshot, try to apply anything already buffered."""
+        snapshot = self.fetch_snapshot()
+        self._apply_snapshot(snapshot)
+        self.state = SyncState.BUFFERING
+        self._try_bootstrap_from_buffer()
+
+    # --- live event handling ------------------------------------------------
+
+    def resync(self) -> None:
+        """Gap detected: drop state, go back to SYNCING so the caller re-bootstraps."""
+        self.state = SyncState.SYNCING
+        self.book = OrderBook(self.symbol)
+        self._last_applied_u = None
+
+    def handle_event(self, event: dict) -> bool:
+        """Feed one diff-depth event through the state machine.
+        Returns True if applied/usefully buffered, False if a gap was detected."""
+        if self.state in (SyncState.SYNCING, SyncState.BUFFERING):
+            self._buffer.append(event)
+            return True
+
+        if event["U"] != self._last_applied_u + 1:
+            logger.warning(
+                "Gap detected for %s: expected U=%s, got U=%s. Resyncing.",
+                self.symbol, self._last_applied_u + 1, event["U"],
+            )
+            self.metrics.record_gap()
+            self.resync()
+            self._buffer.append(event)
+            return False
+
+        self._apply_event(event)
+        return True
+
+    # --- live run loop -------------------------------------------------------
+
+    async def run(self) -> None:
+        """Connect to the WebSocket stream and drive the state machine forever."""
+        url = BINANCE_WS_URL_TEMPLATE.format(symbol=self.symbol)
+        async with websockets.connect(url) as ws:
+            self.state = SyncState.SYNCING
+            self._buffer.clear()
+            snapshot_task = asyncio.create_task(asyncio.to_thread(self.fetch_snapshot))
+
+            async for raw in ws:
+                event = json.loads(raw)
+
+                if self.state == SyncState.LIVE:
+                    self.handle_event(event)
+                    if self.state != SyncState.LIVE:
+                        # gap just triggered a resync -> re-fetch snapshot
+                        snapshot_task = asyncio.create_task(asyncio.to_thread(self.fetch_snapshot))
+                    continue
+
+                self._buffer.append(event)
+
+                if not snapshot_task.done():
+                    continue
+
+                snapshot = snapshot_task.result()
+                self._apply_snapshot(snapshot)
+                self.state = SyncState.BUFFERING
+                self._try_bootstrap_from_buffer()
