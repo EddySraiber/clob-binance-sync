@@ -182,38 +182,38 @@ staleness exceeds a few seconds (feed has silently stalled).
 
 ## 9. Future Scalability — Open Design Gaps
 
-9.1 Partial / progressive depth loading
+### 9.1 Partial / progressive depth loading
 
 Right now bootstrap loads the entire REST snapshot into the tree before going LIVE. For wide books this is wasted work: trading activity concentrates near the touch, and deep levels are rarely queried. An alternative: bootstrap only the top N levels needed to answer best_bid/best_ask/shallow depth() calls immediately, and lazily materialize deeper levels from the snapshot in the background (or on first request for that depth). The risk is exactly what you flagged — a lazily-loaded deep level is "phantom": it reflects a point-in-time snapshot and may already be gone by the time it's materialized. This only matters if something actually reads that level, so the design should make the trade-off explicit rather than silent (see 9.4).
 
-9.2 Snapshot depth is capped — it's never "the whole book"
+### 9.2 Snapshot depth is capped — it's never "the whole book"
 
 Worth stating as fact, not assumption: Binance's REST snapshot endpoint doesn't return the full book at all — limit is capped to one of {5, 10, 20, 50, 100, 500, 1000, 5000}, default 100, max 5000, and request weight scales with the limit chosen (e.g. limit=5000 costs far more than limit=100). So "full depth" in this system already means "the top 5000 levels," not literally everything in Binance's matching engine. This should be called out as an explicit assumption/limitation, and the chosen limit should be a config knob traded off against REST weight budget and how deep the consumer actually needs to see.
 
-9.3 Parallelization strategy
+### 9.3 Parallelization strategy
 
 Per-symbol state must stay single-writer (Section 1b), but parallelism is still available at other levels: (a) across symbols — each SyncManager is independent, so N symbols can run on N tasks/processes with no shared state; (b) within the pipeline — WebSocket read, JSON parsing, and tree application can be split into stages connected by a bounded queue, so a slow tree-apply doesn't block the socket read (this also sets up 9.5); (c) read parallelism — multiple readers can safely query best_bid/depth() concurrently if the tree is wrapped with a reader-writer lock, since reads vastly outnumber writes in most consumption patterns.
 
-9.4 Tiered freshness / staleness budget by depth
+### 9.4 Tiered freshness / staleness budget by depth
 
 Formalize what 9.1 implies: define an explicit SLA where top-of-book (say, top 10-20 levels) must be within some bound (e.g. <100ms) of the live stream, while deeper levels are "best-effort" and may lag further behind. This turns an implicit risk (stale deep levels) into a stated guarantee consumers can design around, and justifies only aggressively re-syncing/validating the shallow part of the book on a tight loop.
 
-9.5 Backpressure & slow-consumer handling
+### 9.5 Backpressure & slow-consumer handling
 
 If tree-apply (or a downstream consumer, see 9.7) can't keep up with the WebSocket's event rate, events pile up somewhere. Needs an explicit policy: bounded in-memory queue with a max size, and on overflow either (a) drop and force a resync (safe, loses no correctness, costs a REST call), or (b) block the socket read (safe but risks the connection timing out server-side). Silently growing an unbounded buffer is the one option that's never acceptable — it masks the problem until it OOMs.
 
-9.6 Memory bounds & long-tail price-level eviction
+### 9.6 Memory bounds & long-tail price-level eviction
 
 Under extreme volatility (flash crash, thin altcoin book), the tree can accumulate many far-from-touch price levels that will plausibly never trade. Worth capping total tracked levels per side (e.g. keep only the nearest 5000 to the touch, matching 9.2's snapshot cap) and evicting beyond that, rather than letting the tree grow unbounded during a volatile period.
 
-9.7 Fan-out to multiple consumers
+### 9.7 Fan-out to multiple consumers
 
 If more than one downstream service needs this book (a pricing service, a risk engine, a UI), each shouldn't open its own Binance connection — that multiplies exchange-side connection/rate-limit pressure for no benefit, since they'd all converge on the same state anyway. Better: one SyncManager per symbol publishes book deltas (or periodic snapshots) to an internal pub/sub layer (Kafka, Redis Streams, etc.), and consumers subscribe there instead of each re-implementing the Binance sync dance.
 
-9.8 Connection resiliency beyond gap detection
+### 9.8 Connection resiliency beyond gap detection
 
 Gap detection (Section 3c) catches missed events, but not a degraded connection — e.g. a socket that's alive but delivering events with growing latency, which won't trip the U/u continuity check. Worth adding: a staleness watchdog (already tracked in metrics.py) that forces a reconnect if no event has arrived within an expected interval, and for high-availability symbols, a secondary WebSocket connection run in parallel so a primary disconnect doesn't cause a visible gap.
 
-9.9 Continuous integrity verification
+### 9.9 Continuous integrity verification
 
 Currently the book is only checked against Binance's source of truth reactively — when a gap is detected. For a stronger guarantee, periodically (e.g. every few minutes) fetch an independent REST snapshot and diff it against the live-maintained book even when no gap was detected, to catch silent corruption from a logic bug rather than just stream desync. This is strictly a monitoring addition (alert on mismatch), not a correctness mechanism — it should never be relied on to fix state, only to detect when something's wrong.
